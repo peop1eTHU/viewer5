@@ -199,17 +199,22 @@
     mediaMode === "images" ? "Images only" : mediaMode === "videos" ? "Videos only" : "Mixed",
   );
 
-  const warmedGalleryPaths = new Set<string>();
+  const VIDEO_EXTS = new Set(["mp4", "mov", "webm", "mkv", "avi", "m4v", "mpg", "mpeg", "wmv", "flv"]);
+
+  function isVideoPath(path: string): boolean {
+    const ext = path.split(".").pop()?.toLowerCase() ?? "";
+    return VIDEO_EXTS.has(ext);
+  }
+
+  let preloadSrcs = $state<string[]>([]);
+  let galleryItems = $state<MediaCatalogItem[]>([]);
+  let galleryVisibleCount = $state(80);
+
+  const orderedImageCatalog = $derived(galleryItems.filter((item) => item.mediaType === "image"));
+  const displayedGalleryItems = $derived(orderedImageCatalog.slice(0, galleryVisibleCount));
 
   onMount(() => {
     void refreshPresets();
-  });
-
-  $effect(() => {
-    if (summary.total <= 0) return;
-    if (viewMode === "waterfall" || viewMode === "mosaic") {
-      void warmGalleryCache(260);
-    }
   });
 
   $effect(() => {
@@ -233,18 +238,37 @@
     currentMedia = response;
     currentMediaSrc = response ? convertFileSrc(response.path) : "";
 
-    if (!response) return;
-    for (const preloadPath of response.preloadPaths) {
-      if (response.mediaType === "image") {
-        const image = new Image();
-        image.src = convertFileSrc(preloadPath);
-      }
+    if (!response) {
+      preloadSrcs = [];
+      return;
     }
+    // Pre-render next images as hidden DOM elements so WebKit keeps them decoded.
+    // Only images (not videos) benefit from this; we take up to 5 ahead.
+    preloadSrcs = response.preloadPaths
+      .filter((p) => !isVideoPath(p))
+      .slice(0, 5)
+      .map((p) => convertFileSrc(p));
   }
 
   async function refreshLibraryMeta() {
-    summary = await invoke<LibrarySummary>("library_summary");
-    catalog = await invoke<MediaCatalogItem[]>("media_catalog");
+    [summary, catalog, galleryItems] = await Promise.all([
+      invoke<LibrarySummary>("library_summary"),
+      invoke<MediaCatalogItem[]>("media_catalog"),
+      invoke<MediaCatalogItem[]>("gallery_ordered_catalog"),
+    ]);
+    galleryVisibleCount = 80;
+  }
+
+  async function refreshGalleryOrder() {
+    galleryItems = await invoke<MediaCatalogItem[]>("gallery_ordered_catalog");
+    galleryVisibleCount = 80;
+  }
+
+  function handleGalleryScroll(event: Event) {
+    const el = event.currentTarget as HTMLElement;
+    if (el.scrollHeight - el.scrollTop - el.clientHeight < 500) {
+      galleryVisibleCount = Math.min(galleryVisibleCount + 60, orderedImageCatalog.length);
+    }
   }
 
   async function refreshPresets() {
@@ -369,7 +393,6 @@
 
     isBusy = true;
     errorText = "";
-    warmedGalleryPaths.clear();
     try {
       const response = await invoke<MediaResponse>("build_library", {
         includeFolders,
@@ -378,7 +401,6 @@
       });
       setCurrentMedia(response);
       await refreshLibraryMeta();
-      void warmGalleryCache(300);
     } catch (error) {
       setCurrentMedia(null);
       errorText = String(error);
@@ -425,8 +447,7 @@
       const response = await invoke<MediaResponse>("reshuffle_library");
       setCurrentMedia(response);
       summary = await invoke<LibrarySummary>("library_summary");
-      warmedGalleryPaths.clear();
-      void warmGalleryCache(260);
+      void refreshGalleryOrder();
     } catch (error) {
       errorText = String(error);
     } finally {
@@ -442,8 +463,7 @@
       const response = await invoke<MediaResponse>("focus_current_folder");
       setCurrentMedia(response);
       summary = await invoke<LibrarySummary>("library_summary");
-      warmedGalleryPaths.clear();
-      void warmGalleryCache(220);
+      void refreshGalleryOrder();
     } catch (error) {
       errorText = String(error);
     } finally {
@@ -459,8 +479,7 @@
       const response = await invoke<MediaResponse>("clear_folder_focus");
       setCurrentMedia(response);
       summary = await invoke<LibrarySummary>("library_summary");
-      warmedGalleryPaths.clear();
-      void warmGalleryCache(260);
+      void refreshGalleryOrder();
     } catch (error) {
       errorText = String(error);
     } finally {
@@ -484,17 +503,6 @@
     }
   }
 
-  async function warmGalleryCache(limit: number) {
-    const paths = await invoke<string[]>("gallery_preload_paths", { limit, imagesOnly: true });
-    for (const path of paths) {
-      if (warmedGalleryPaths.has(path)) continue;
-      warmedGalleryPaths.add(path);
-      const img = new Image();
-      img.decoding = "sync";
-      img.src = convertFileSrc(path);
-    }
-  }
-
   function handleKeydown(event: KeyboardEvent) {
     if (event.key === "ArrowRight") {
       void nextMedia();
@@ -510,6 +518,13 @@
 </script>
 
 <svelte:window onkeydown={handleKeydown} />
+
+<!-- Hidden preload buffer: keeps next images decoded in WebKit's compositor cache -->
+<div aria-hidden="true" style="position:fixed;left:0;bottom:0;pointer-events:none;z-index:-1;visibility:hidden">
+  {#each preloadSrcs as src (src)}
+    <img {src} alt="" style="position:absolute;width:1px;height:1px" />
+  {/each}
+</div>
 
 <div class={`h-screen overflow-hidden ${themeClass[themeMode]}`}>
   <div class="grid h-full grid-rows-[auto_minmax(0,1fr)_auto] gap-3 p-3 xl:p-4">
@@ -580,9 +595,9 @@
             </div>
           {:else if viewMode === "waterfall"}
             <ScrollArea.Root type="always" class={`h-full min-h-0 max-w-full rounded-xl ${softClass[themeMode]}`}>
-              <ScrollArea.Viewport class="h-full w-full overflow-x-hidden overflow-y-auto p-3">
+              <ScrollArea.Viewport class="h-full w-full overflow-x-hidden overflow-y-auto p-3" onscroll={handleGalleryScroll}>
                 <div class="columns-1 gap-4 sm:columns-2 lg:columns-3 2xl:columns-4">
-                  {#each imageCatalog as item, i}
+                  {#each displayedGalleryItems as item, i}
                     <Button.Root
                       class={`mb-4 block w-full break-inside-avoid overflow-hidden text-left shadow-sm transition hover:-translate-y-0.5 hover:shadow-md ${i % 5 === 0 ? "rounded-3xl" : i % 3 === 0 ? "rounded-2xl" : "rounded-xl"} ${i % 2 === 0 ? "bg-black/5 dark:bg-white/10" : "bg-black/10 dark:bg-white/15"}`}
                       onclick={() => jumpToMedia(item.path)}
@@ -590,6 +605,9 @@
                       <img src={convertFileSrc(item.path)} alt={item.fileName} class="h-auto w-full object-cover" loading="lazy" />
                     </Button.Root>
                   {/each}
+                  {#if orderedImageCatalog.length > 0 && galleryVisibleCount < orderedImageCatalog.length}
+                    <div class="py-6 text-center text-xs opacity-40">Scroll for more ({orderedImageCatalog.length - galleryVisibleCount} remaining)</div>
+                  {/if}
                 </div>
               </ScrollArea.Viewport>
               <ScrollArea.Scrollbar orientation="vertical" class="w-2">
@@ -598,9 +616,9 @@
             </ScrollArea.Root>
           {:else}
             <ScrollArea.Root type="always" class={`h-full min-h-0 max-w-full rounded-xl ${softClass[themeMode]}`}>
-              <ScrollArea.Viewport class="h-full w-full overflow-auto p-3">
+              <ScrollArea.Viewport class="h-full w-full overflow-auto p-3" onscroll={handleGalleryScroll}>
                 <div class="grid auto-rows-[140px] grid-cols-2 gap-3 md:grid-cols-4 xl:grid-cols-6">
-                  {#each imageCatalog as item, i}
+                  {#each displayedGalleryItems as item, i}
                     <Button.Root
                       class={`overflow-hidden rounded-xl bg-black/5 dark:bg-white/10 ${i % 7 === 0 ? "md:col-span-2 md:row-span-2" : i % 5 === 0 ? "md:row-span-2" : ""}`}
                       onclick={() => jumpToMedia(item.path)}
@@ -608,6 +626,9 @@
                       <img src={convertFileSrc(item.path)} alt={item.fileName} class="h-full w-full object-cover" loading="lazy" />
                     </Button.Root>
                   {/each}
+                  {#if orderedImageCatalog.length > 0 && galleryVisibleCount < orderedImageCatalog.length}
+                    <div class="col-span-full py-6 text-center text-xs opacity-40">Scroll for more ({orderedImageCatalog.length - galleryVisibleCount} remaining)</div>
+                  {/if}
                 </div>
               </ScrollArea.Viewport>
               <ScrollArea.Scrollbar orientation="vertical" class="w-2">

@@ -533,6 +533,47 @@ async fn gallery_preload_paths(
 }
 
 #[tauri::command]
+async fn gallery_ordered_catalog(state: State<'_, AppState>) -> Result<Vec<MediaCatalogItem>, String> {
+    let guard = lock_library(&state)?;
+    if !guard.has_media() {
+        return Ok(Vec::new());
+    }
+
+    let total = guard.current_view_total();
+    let mut result = Vec::with_capacity(total);
+
+    for pos in 0..total {
+        let maybe_idx = match &guard.mode {
+            NavigationMode::Global { .. } => guard.global_order.get(pos).copied(),
+            NavigationMode::Folder { folder, .. } => guard
+                .folder_groups
+                .get(folder)
+                .and_then(|group| group.get(pos).copied()),
+        };
+
+        let Some(idx) = maybe_idx else {
+            continue;
+        };
+        let Some(item) = guard.media_items.get(idx) else {
+            continue;
+        };
+
+        result.push(MediaCatalogItem {
+            path: item.path.to_string_lossy().to_string(),
+            file_name: item
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_string(),
+            media_type: item.kind.as_str().to_string(),
+        });
+    }
+
+    Ok(result)
+}
+
+#[tauri::command]
 async fn list_presets(app: AppHandle) -> Result<Vec<PresetRecord>, String> {
     read_presets(&app)
 }
@@ -942,6 +983,7 @@ pub fn run() {
             media_catalog,
             jump_to_media,
             gallery_preload_paths,
+            gallery_ordered_catalog,
             list_presets,
             save_preset,
             rename_preset,
